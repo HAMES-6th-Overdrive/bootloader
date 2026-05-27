@@ -178,28 +178,29 @@ boolean OTA_Flash_Write(uint32 addr, uint8 *data, uint16 len, IfxFlash_FlashType
     return TRUE;
 }
 
-/* ── CRC32 검증 ─────────────────────────────────────────────── */
-/* Flash에 기록된 데이터를 읽어서 CRC 계산                         */
+uint32 OTA_Flash_CalcCRC32(uint32 addr, uint32 size)
+{
+    uint32 crc = 0xFFFFFFFFU;
+    volatile const uint8 *ptr = (volatile const uint8 *)addr;
+
+    for (uint32 i = 0U; i < size; i++)
+    {
+        crc ^= (uint32)ptr[i];
+
+        for (uint8 j = 0U; j < 8U; j++)
+        {
+            crc = (crc >> 1U) ^ (0xEDB88320UL & (uint32)(-(sint32)(crc & 1U)));
+        }
+    }
+
+    return crc ^ 0xFFFFFFFFU;
+}
+
 boolean OTA_Flash_VerifyCRC(uint32 addr, uint32 size, uint32 expectedCRC)
 {
-    uint32  crc = 0xFFFFFFFF;
-    uint8  *ptr = (uint8 *)addr;
+    uint32 crc = OTA_Flash_CalcCRC32(addr, size);
 
-    for (uint32 i = 0; i < size; i++)
-    {
-        crc ^= ptr[i];
-        for (uint8 j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xEDB88320UL & (uint32)(-(sint32)(crc & 1)));
-    }
-    crc ^= 0xFFFFFFFF;
-
-    /*
-     * TODO: RPi가 0x37 요청에 예상 CRC를 포함해서 보내도록 확장 시
-     *       여기서 expected CRC와 비교.
-     *       현재는 계산만 하고 항상 TRUE 반환 (개발 단계)
-     */
-    //return TRUE;
-    return (crc == expectedCRC);  // 실제 비교
+    return (crc == expectedCRC) ? TRUE : FALSE;
 }
 
 void OTA_Flash_ClearFlag(void)

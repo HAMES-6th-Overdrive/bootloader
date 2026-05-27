@@ -31,6 +31,7 @@
 #include "bootloader.h"
 #include "ota_flash.h"
 #include "sota_ucb.h"
+#include <string.h>
 /*********************************************************************************************************************/
 
 /*********************************************************************************************************************/
@@ -39,6 +40,31 @@
 
 /*********************************************************************************************************************/
 /*-------------------------------------------------Global variables--------------------------------------------------*/
+typedef struct
+{
+    uint32 flag;
+
+    uint32 fwSize;
+    uint32 expectedCrc;
+
+    uint32 isGroupBActive;
+
+    uint32 selectedCrcStart;
+    uint32 selectedCrcSize;
+    uint32 selectedCrc;
+    uint32 selectedCrcMatch;
+
+    uint32 crcCheckDone;
+    uint32 crcCheckFailed;
+
+    uint32 swapRequested;
+    uint32 swapTargetGroup;   /* 0 = Group A, 1 = Group B, 0xFFFFFFFF = none */
+
+    uint32 trapAvoided;
+
+} Bootloader_CrcDebug_t;
+
+volatile Bootloader_CrcDebug_t g_bootCrcDebug;
 /*********************************************************************************************************************/
 
 /*********************************************************************************************************************/
@@ -66,69 +92,159 @@ static void Bootloader_JumpToApp(uint32 appAddr)
 
 void Bootloader_Main(void)
 {
-    //OTA flag 확인
-    uint32 flag = *(volatile uint32 *)OTA_FLAG_ADDR;
-    //SOTA 초기화 여부 확인
-    if (!SOTA_IsInitialized())
-    {
-        SOTA_InitialSetup();
-        while (1) {}
-    }
+    uint32 flag;
 
-    //OTA 플래그가 설정된 경우 → OTA 검증 → 그룹 스왑 → 새 FW 부팅
-    
+    /*
+     * OTA flag 확인
+     */
+    flag = *(volatile uint32 *)OTA_FLAG_ADDR;
+
+    /*
+     * OTA 플래그가 설정된 경우
+     * → inactive logical window CRC 검증
+     * → 현재 active group의 반대로 swap
+     * → app 부팅
+     */
     if (flag == OTA_FLAG_MAGIC)
     {
-        uint32 fwSize     = *(volatile uint32 *)(OTA_FLAG_ADDR + 8);
-        uint32 expectedCRC = *(volatile uint32 *)(OTA_FLAG_ADDR + 16);
-        
-        boolean isGroupBActive = SOTA_IsGroupBActive();
+        uint32 fwSize;
+        uint32 expectedCRC;
+        boolean isGroupBActive;
 
-        //uint32 targetStart = isGroupBActive ? BANK_A_START : BANK_B_START;
-        //uint32 targetSize  = isGroupBActive ? BANK_A_SIZE  : BANK_B_SIZE;
-        uint32 targetStart = BANK_B_START;   /* SOTA swap 전 inactive logical slot */
-        uint32 targetSize  = BANK_B_SIZE;
-        //fwSize = targetSize;
+        uint32 targetStart;
+        uint32 targetSize;
 
-        // 검증 성공 시 Group B로 스왑, 실패 시 Group A로 스왑 
-#if 1        
-        if ((fwSize > 0) &&
-            (fwSize <= targetSize) &&
-            OTA_Flash_VerifyCRC(targetStart, fwSize, expectedCRC))
-#else
-        if (1)
-#endif
+        fwSize = *(volatile uint32 *)(OTA_FLAG_ADDR + 8);
+        expectedCRC = *(volatile uint32 *)(OTA_FLAG_ADDR + 16);
+
+        isGroupBActive = SOTA_IsGroupBActive();
+
+        /*
+         * 중요:
+         * SOTA alternative mapping 상태에서 BANK_A_START(0x80020000)를
+         * bootloader가 CRC 용도로 직접 읽으면 bus trap이 날 수 있음.
+         *
+         * 따라서 CRC 검증은 CPU가 보는 inactive/download logical window인
+         * BANK_B_START(0x80320000) 기준으로 고정한다.
+         *
+         * 단, swap 방향은 현재 active group 기준으로 결정한다.
+         */
+        targetStart = BANK_B_START;
+        targetSize = BANK_B_SIZE;
+
+        memset((void *)&g_bootCrcDebug, 0, sizeof(g_bootCrcDebug));
+
+        g_bootCrcDebug.flag = flag;
+        g_bootCrcDebug.fwSize = fwSize;
+        g_bootCrcDebug.expectedCrc = expectedCRC;
+        g_bootCrcDebug.isGroupBActive = (isGroupBActive == TRUE) ? 1U : 0U;
+
+        g_bootCrcDebug.selectedCrcStart = targetStart;
+        g_bootCrcDebug.selectedCrcSize = targetSize;
+        g_bootCrcDebug.swapTargetGroup = 0xFFFFFFFFU;
+
+        /*
+         * BANK_A_START CRC 계산은 하지 않는다.
+         * 해당 주소 read에서 trap 가능.
+         */
+        g_bootCrcDebug.trapAvoided = 1U;
+
+        if ((fwSize > 0U) && (fwSize <= targetSize))
         {
-            OTA_Flash_ClearFlag();
+            g_bootCrcDebug.selectedCrc =
+                OTA_Flash_CalcCRC32(targetStart, fwSize);
 
-            printf("swap\n");
-            for (int i = 0; i < 10000000; ++i);            
-
-            if (isGroupBActive)
-                SOTA_SwapToGroupA();
-            else
-                SOTA_SwapToGroupB();
-
-            Bootloader_JumpToApp(APP_START_ADDR);
+            g_bootCrcDebug.selectedCrcMatch =
+                (g_bootCrcDebug.selectedCrc == expectedCRC) ? 1U : 0U;
         }
-        // 검증 실패 시 → 플래그 클리어 → Group A로 스왑 (복구 시나리오) → 새 FW 부팅
         else
         {
-            printf("crc failed\n");
+            g_bootCrcDebug.selectedCrc = 0xFFFFFFFFU;
+            g_bootCrcDebug.selectedCrcMatch = 0U;
+        }
+
+        g_bootCrcDebug.crcCheckDone = 1U;
+
+        if (g_bootCrcDebug.selectedCrcMatch == 1U)
+        {
+            g_bootCrcDebug.crcCheckFailed = 0U;
+
+            /*
+             * CRC 성공 시 flag clear 후 swap.
+             * flag를 먼저 지워야 reset 후 같은 OTA 처리를 반복하지 않음.
+             */
             OTA_Flash_ClearFlag();
 
-            // if (SOTA_IsGroupBActive())
-            //     SOTA_SwapToGroupA();
-            // else
-            //     SOTA_SwapToGroupB();
-                    
+            printf("crc ok\r\n");
+            printf("activeB=%u\r\n", g_bootCrcDebug.isGroupBActive);
+            printf("expected=0x%08X\r\n", g_bootCrcDebug.expectedCrc);
+            printf("crc@0x%08X=0x%08X match=%u\r\n",
+                   g_bootCrcDebug.selectedCrcStart,
+                   g_bootCrcDebug.selectedCrc,
+                   g_bootCrcDebug.selectedCrcMatch);
+
+            printf("swap\r\n");
+
+            for (int i = 0; i < 10000000; ++i)
+            {
+                __nop();
+            }
+
+            g_bootCrcDebug.swapRequested = 1U;
+
+            if (isGroupBActive == TRUE)
+            {
+                /*
+                 * 현재 Group B active
+                 * → 방금 받은 이미지를 활성화하기 위해 Group A로 swap
+                 */
+                g_bootCrcDebug.swapTargetGroup = 0U;
+                SOTA_SwapToGroupA();
+            }
+            else
+            {
+                /*
+                 * 현재 Group A active
+                 * → 방금 받은 이미지를 활성화하기 위해 Group B로 swap
+                 */
+                g_bootCrcDebug.swapTargetGroup = 1U;
+                SOTA_SwapToGroupB();
+            }
+
+            /*
+             * SOTA_SwapToGroupA/B 내부에서 reset이 걸리는 구조라면
+             * 이 아래는 보통 도달하지 않음.
+             * 혹시 reset이 안 걸리는 구현이면 app jump fallback.
+             */
+            Bootloader_JumpToApp(APP_START_ADDR);
+        }
+        else
+        {
+            g_bootCrcDebug.crcCheckFailed = 1U;
+
+            printf("crc failed\r\n");
+            printf("activeB=%u\r\n", g_bootCrcDebug.isGroupBActive);
+            printf("expected=0x%08X\r\n", g_bootCrcDebug.expectedCrc);
+            printf("crc@0x%08X=0x%08X match=%u\r\n",
+                   g_bootCrcDebug.selectedCrcStart,
+                   g_bootCrcDebug.selectedCrc,
+                   g_bootCrcDebug.selectedCrcMatch);
+
+            /*
+             * CRC 실패 시 flag를 지우고 현재 active app으로 복귀.
+             * 여기서는 강제 swap하지 않는다.
+             */
+            OTA_Flash_ClearFlag();
+
             Bootloader_JumpToApp(APP_START_ADDR);
         }
     }
-    //OTA 플래그가 설정되지 않은 경우 → 정상 부팅
     else
     {
+        /*
+         * OTA flag 없음
+         * → 현재 active app 정상 부팅
+         */
         Bootloader_JumpToApp(APP_START_ADDR);
     }
 }
-/*********************************************************************************************************************/
